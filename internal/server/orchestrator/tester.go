@@ -13,6 +13,7 @@ import (
 	"github.com/tidwall/gjson"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/looplj/axonhub/internal/ent/model"
 	"github.com/looplj/axonhub/internal/log"
 	"github.com/looplj/axonhub/internal/objects"
 	"github.com/looplj/axonhub/internal/pkg/xjson"
@@ -38,6 +39,7 @@ type TestChannelOrchestrator struct {
 	usageLogService             *biz.UsageLogService
 	promptProtectionRuleService *biz.PromptProtectionRuleService
 	httpClient                  *httpclient.HttpClient
+	modelService                *biz.ModelService
 	modelCircuitBreaker         *biz.ModelCircuitBreaker
 	modelMapper                 *ModelMapper
 	loadBalancer                *LoadBalancer
@@ -52,6 +54,7 @@ func NewTestChannelOrchestrator(
 	usageLogService *biz.UsageLogService,
 	promptProtectionRuleService *biz.PromptProtectionRuleService,
 	httpClient *httpclient.HttpClient,
+	modelService *biz.ModelService,
 ) *TestChannelOrchestrator {
 	return &TestChannelOrchestrator{
 		channelService:              channelService,
@@ -60,6 +63,7 @@ func NewTestChannelOrchestrator(
 		usageLogService:             usageLogService,
 		promptProtectionRuleService: promptProtectionRuleService,
 		httpClient:                  httpClient,
+		modelService:                modelService,
 		modelCircuitBreaker:         biz.NewModelCircuitBreaker(),
 		modelMapper:                 NewModelMapper(),
 		loadBalancer:                NewLoadBalancer(systemService, channelService, NewWeightStrategy()),
@@ -143,6 +147,57 @@ type TestChannelResult struct {
 	Error   *string
 }
 
+// isTTSModel checks whether a model outputs audio by looking up its model card.
+func (processor *TestChannelOrchestrator) isTTSModel(ctx context.Context, modelID string) bool {
+	if processor.modelService == nil || modelID == "" {
+		return false
+	}
+
+	m, err := processor.modelService.GetModelByModelID(ctx, modelID, model.StatusEnabled)
+	if err != nil {
+		return false
+	}
+
+	if m.ModelCard == nil {
+		return false
+	}
+
+	for _, output := range m.ModelCard.Modalities.Output {
+		if output == "audio" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// buildTestRequest constructs the appropriate test request for a model.
+// For TTS models, it builds a request with audio modalities and parameters.
+// For regular models, it delegates to buildChannelTestRequest so that the
+// configurable test prompts and Responses-WebSocket handling keep working.
+func (processor *TestChannelOrchestrator) buildTestRequest(ctx context.Context, testModel string, useStream bool, systemPrompt string, userPrompt string, responsesWebSocket bool) *llm.Request {
+	if processor.isTTSModel(ctx, testModel) {
+		return &llm.Request{
+			Model: testModel,
+			Messages: []llm.Message{
+				{
+					Role: "assistant",
+					Content: llm.MessageContent{
+						Content: lo.ToPtr("Hello, this is a TTS test. Please respond with audio."),
+					},
+				},
+			},
+			Modalities:          []string{"text", "audio"},
+			Audio:               &llm.ChatCompletionAudioParam{},
+			MaxCompletionTokens: lo.ToPtr(int64(256)),
+			Stream:              lo.ToPtr(useStream),
+		}
+	}
+
+	// Standard chat completion request for non-TTS models.
+	return buildChannelTestRequest(testModel, useStream, systemPrompt, userPrompt, responsesWebSocket)
+}
+
 // TestChannel tests a specific channel with a simple request.
 func (processor *TestChannelOrchestrator) TestChannel(
 	ctx context.Context,
@@ -191,7 +246,8 @@ func (processor *TestChannelOrchestrator) TestChannel(
 	// Check if the channel requires streaming
 	useStream := channel != nil && channel.Policies.Stream == objects.CapabilityPolicyRequire
 
-	llmRequest := buildChannelTestRequest(testModel, useStream, systemPrompt, userPrompt, usesResponsesWebSocket(channel))
+	// Build the appropriate test request based on model type
+	llmRequest := processor.buildTestRequest(ctx, testModel, useStream, systemPrompt, userPrompt, usesResponsesWebSocket(channel))
 
 	body, err := json.Marshal(llmRequest)
 	if err != nil {
@@ -246,10 +302,14 @@ func (processor *TestChannelOrchestrator) TestChannel(
 		}, nil
 	}
 
+	// Extract message text or audio transcript from the response.
+	msg := response.Choices[0].Message
+	messageText := extractMessageText(msg)
+
 	return &TestChannelResult{
 		Latency: latency,
 		Success: true,
-		Message: response.Choices[0].Message.Content.Content,
+		Message: messageText,
 		Error:   nil,
 	}, nil
 }
@@ -266,6 +326,7 @@ func (processor *TestChannelOrchestrator) handleStreamResponse(
 
 	// Accumulate stream chunks
 	var accumulatedContent string
+	var hasAudioResponse bool
 
 	for stream.Next() {
 		select {
@@ -297,8 +358,19 @@ func (processor *TestChannelOrchestrator) handleStreamResponse(
 		}
 
 		// Accumulate content from the first choice
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil && chunk.Choices[0].Delta.Content.Content != nil {
-			accumulatedContent += *chunk.Choices[0].Delta.Content.Content
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta != nil {
+			delta := chunk.Choices[0].Delta
+			if delta.Content.Content != nil {
+				accumulatedContent += *delta.Content.Content
+			}
+
+			// Also accumulate audio transcripts from TTS streaming responses.
+			if delta.Audio != nil {
+				hasAudioResponse = true
+				if delta.Audio.Transcript != "" {
+					accumulatedContent += delta.Audio.Transcript
+				}
+			}
 		}
 	}
 
@@ -324,6 +396,15 @@ func (processor *TestChannelOrchestrator) handleStreamResponse(
 	}
 
 	if accumulatedContent == "" {
+		if hasAudioResponse {
+			return &TestChannelResult{
+				Latency: latency,
+				Success: true,
+				Message: lo.ToPtr("(audio stream response)"),
+				Error:   nil,
+			}, nil
+		}
+
 		return &TestChannelResult{
 			Latency: latency,
 			Success: false,
@@ -543,7 +624,7 @@ func (processor *TestChannelOrchestrator) testSingleKey(
 		modelCircuitBreaker:        processor.modelCircuitBreaker,
 	}
 
-	llmRequest := buildChannelTestRequest(testModel, useStream, systemPrompt, userPrompt, responsesWebSocket)
+	llmRequest := processor.buildTestRequest(ctx, testModel, useStream, systemPrompt, userPrompt, responsesWebSocket)
 
 	body, err := json.Marshal(llmRequest)
 	if err != nil {
@@ -628,4 +709,31 @@ func maskAPIKey(key string) string {
 	}
 
 	return key[:4] + "****" + key[len(key)-4:]
+}
+
+// extractMessageText extracts displayable text from a message, handling both text
+// and audio responses. For TTS models, the response may contain audio data with a
+// transcript instead of plain text content.
+func extractMessageText(msg *llm.Message) *string {
+	if msg == nil {
+		return lo.ToPtr("")
+	}
+
+	// Prefer text content if available.
+	if msg.Content.Content != nil && *msg.Content.Content != "" {
+		return msg.Content.Content
+	}
+
+	// Fall back to audio transcript for TTS responses.
+	if msg.Audio != nil {
+		if msg.Audio.Transcript != "" {
+			return lo.ToPtr(msg.Audio.Transcript)
+		}
+
+		if msg.Audio.Data != "" {
+			return lo.ToPtr("(audio response)")
+		}
+	}
+
+	return lo.ToPtr("")
 }

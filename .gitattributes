@@ -1,0 +1,7 @@
+# Force LF for files that are embedded into build artifacts / parsed by
+# shell tools inside Linux containers (CRLF leaks \r into version strings,
+# ldflags, etc.). core.autocrlf=true on Windows would otherwise add \r.
+internal/build/VERSION eol=lf
+*.sh eol=lf
+Dockerfile eol=lf
+*.graphql eol=lf
