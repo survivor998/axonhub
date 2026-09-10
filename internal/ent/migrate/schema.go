@@ -793,6 +793,11 @@ var (
 				Unique:  false,
 				Columns: []*schema.Column{ThreadsColumns[5], ThreadsColumns[4]},
 			},
+			{
+				Name:    "threads_by_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{ThreadsColumns[1]},
+			},
 		},
 	}
 	// TracesColumns holds the columns for the "traces" table.
@@ -844,6 +849,11 @@ var (
 				Name:    "traces_by_project_id_status",
 				Unique:  false,
 				Columns: []*schema.Column{TracesColumns[5], TracesColumns[4]},
+			},
+			{
+				Name:    "traces_by_created_at",
+				Unique:  false,
+				Columns: []*schema.Column{TracesColumns[1]},
 			},
 		},
 	}
