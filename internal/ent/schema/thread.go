@@ -31,6 +31,8 @@ func (Thread) Indexes() []ent.Index {
 			Unique(),
 		index.Fields("project_id", "status").
 			StorageKey("threads_by_project_id_status"),
+		index.Fields("created_at").
+			StorageKey("threads_by_created_at"),
 	}
 }
 

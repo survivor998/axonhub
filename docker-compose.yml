@@ -18,13 +18,18 @@
 services:
   # PostgreSQL 数据库
   postgres:
-    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE must be set (prefer an immutable digest)}
+    container_name: axonhub-postgres
+    # 本地部署默认使用与既有数据卷一致的 postgres:16-alpine，可用 POSTGRES_IMAGE 覆盖
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
     environment:
       POSTGRES_DB: axonhub
       POSTGRES_USER: axonhub
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      # 既有数据卷以默认密码初始化，保持默认值以兼容存量数据；生产环境请务必设置 DB_PASSWORD
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-axonhub_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     networks:
       - axonhub-backend
     read_only: true
@@ -34,7 +39,7 @@ services:
     security_opt:
       - no-new-privileges:true
     shm_size: 512m
-    restart: unless-stopped
+    restart: always
     stop_grace_period: 30s
     logging:
       driver: json-file
@@ -46,16 +51,23 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   # AxonHub 主服务
   axonhub:
-    image: ${AXONHUB_IMAGE:?AXONHUB_IMAGE must be set (prefer an immutable digest)}
+    container_name: axonhub-app
+    # 本地部署：从当前仓库 Dockerfile 构建（包含本地补丁）；如需使用官方镜像可改回 image 并注释 build
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # image: ${AXONHUB_IMAGE:?AXONHUB_IMAGE must be set (prefer an immutable digest)}
     environment:
       # 数据库配置可以通过环境变量设置，优先级高于配置文件
       AXONHUB_DB_DIALECT: postgres
-      AXONHUB_DB_DSN: "postgres://axonhub:${DB_PASSWORD:?DB_PASSWORD must be set}@postgres:5432/axonhub?sslmode=disable"
+      AXONHUB_DB_DSN: "postgres://axonhub:${DB_PASSWORD:-axonhub_password}@postgres:5432/axonhub?sslmode=disable"
     ports:
-      - "${AXONHUB_BIND_ADDRESS:-127.0.0.1}:${AXONHUB_HOST_PORT:-8090}:8090"
+      # 与既有部署保持一致：默认绑定所有网卡；需要仅本机访问时设置 AXONHUB_BIND_ADDRESS=127.0.0.1
+      - "${AXONHUB_BIND_ADDRESS:-}:${AXONHUB_HOST_PORT:-8090}:8090"
     volumes:
       # 配置文件挂载 - 用于复杂配置，如缓存、日志、监控等
       - ./config.yml:/app/config.yml:ro
@@ -81,7 +93,7 @@ services:
           cpus: "${AXONHUB_CPU_LIMIT:-2.0}"
           memory: ${AXONHUB_MEMORY_LIMIT:-1G}
           pids: 256
-    restart: unless-stopped
+    restart: always
     stop_grace_period: 30s
     logging:
       driver: json-file

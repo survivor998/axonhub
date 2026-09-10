@@ -42,9 +42,10 @@ type GcCleanupPreviewItem struct {
 }
 
 type Config struct {
-	CRON          string `json:"cron" yaml:"cron" conf:"cron" validate:"required"`
-	VacuumEnabled bool   `json:"vacuum_enabled" yaml:"vacuum_enabled" conf:"vacuum_enabled"`
-	VacuumFull    bool   `json:"vacuum_full" yaml:"vacuum_full" conf:"vacuum_full"`
+	CRON          string        `json:"cron" yaml:"cron" conf:"cron"`
+	Interval      time.Duration `json:"interval" yaml:"interval" conf:"interval"`
+	VacuumEnabled bool          `json:"vacuum_enabled" yaml:"vacuum_enabled" conf:"vacuum_enabled"`
+	VacuumFull    bool          `json:"vacuum_full" yaml:"vacuum_full" conf:"vacuum_full"`
 }
 
 type Worker struct {
@@ -75,12 +76,22 @@ func NewWorker(params Params) *Worker {
 }
 
 func (w *Worker) RegisterScheduledTasks(ctx context.Context, s *scheduler.Scheduler) error {
-	return s.Register(ctx, scheduler.TaskSpec{
+	spec := scheduler.TaskSpec{
 		Name:        "gc",
 		Description: "Garbage collection — cleanup old requests, stored bodies, traces, usage logs, and channel probes",
-		CronExpr:    w.Config.CRON,
-		Timezone:    "UTC",
-	}, w.runAutomaticCleanup)
+	}
+
+	// Prefer interval-based scheduling so cleanup runs regardless of whether
+	// the machine is powered on at a fixed clock time. Falls back to cron when
+	// no interval is configured.
+	if w.Config.Interval > 0 {
+		spec.FixRate = w.Config.Interval
+	} else {
+		spec.CronExpr = w.Config.CRON
+		spec.Timezone = "UTC"
+	}
+
+	return s.Register(ctx, spec, w.runAutomaticCleanup)
 }
 
 // deleteInBatches deletes records in batches to avoid memory issues.
@@ -640,6 +651,21 @@ func (w *Worker) cleanupChannelProbes(ctx context.Context, cleanupDays int, manu
 }
 
 // runVacuum executes VACUUM command on SQLite/PostgreSQL database.
+// runVacuum reclaims disk space after GC deletes.
+//
+// For SQLite in WAL mode the primary source of unbounded disk growth is the
+// WAL file, not deleted rows. We therefore prefer the lightweight
+// PRAGMA wal_checkpoint(TRUNCATE) which checkpoints outstanding WAL pages
+// and truncates the WAL file. This does NOT require an exclusive lock and
+// will not block concurrent reads or writes.
+//
+// A full VACUUM (which rebuilds the entire database file to reclaim space
+// from deleted rows) is only run when gc.vacuum_full is explicitly enabled.
+// Full VACUUM acquires an exclusive lock and can block live traffic; the
+// busy_timeout pragma on the DSN (default 30 s) mitigates SQLITE_BUSY errors
+// for concurrent connections.
+//
+// For PostgreSQL a standard VACUUM (or VACUUM FULL when enabled) is run.
 func (w *Worker) runVacuum(ctx context.Context) error {
 	if !w.Config.VacuumEnabled {
 		log.Debug(ctx, "VACUUM is disabled, skipping")
@@ -657,34 +683,58 @@ func (w *Worker) runVacuum(ctx context.Context) error {
 		return nil
 	}
 
-	if sqlDriver.Dialect() != dialect.SQLite && sqlDriver.Dialect() != dialect.Postgres {
-		log.Debug(ctx, "Database does not support VACUUM, skipping",
-			log.String("dialect", sqlDriver.Dialect()))
+	d := sqlDriver.Dialect()
+
+	// ── SQLite: lightweight WAL checkpoint (preferred) ──────────────
+	if d == dialect.SQLite {
+		log.Info(ctx, "Running SQLite WAL checkpoint (TRUNCATE)")
+		start := time.Now()
+
+		if _, err := sqlDriver.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			return fmt.Errorf("failed to run wal_checkpoint: %w", err)
+		}
+
+		log.Info(ctx, "SQLite WAL checkpoint completed",
+			log.Duration("duration", time.Since(start)))
+
+		// Full VACUUM is opt-in: only when vacuum_full is true.
+		if w.Config.VacuumFull {
+			log.Info(ctx, "Running SQLite VACUUM (full rebuild)")
+			vStart := time.Now()
+			if _, err := sqlDriver.ExecContext(ctx, "VACUUM"); err != nil {
+				return fmt.Errorf("failed to execute VACUUM: %w", err)
+			}
+			log.Info(ctx, "SQLite VACUUM completed",
+				log.Duration("duration", time.Since(vStart)))
+		}
 
 		return nil
 	}
 
-	log.Info(ctx, "Starting database VACUUM operation",
-		log.String("dialect", sqlDriver.Dialect()),
-		log.Bool("vacuum_full", w.Config.VacuumFull))
+	// ── PostgreSQL ──────────────────────────────────────────────────
+	if d == dialect.Postgres {
+		vacuumSQL := "VACUUM"
+		if w.Config.VacuumFull {
+			vacuumSQL = "VACUUM FULL"
+		}
 
-	startTime := time.Now()
+		log.Info(ctx, "Starting PostgreSQL VACUUM",
+			log.String("command", vacuumSQL))
 
-	var vacuumSQL string
-	if sqlDriver.Dialect() == dialect.Postgres && w.Config.VacuumFull {
-		vacuumSQL = "VACUUM FULL"
-	} else {
-		vacuumSQL = "VACUUM"
+		start := time.Now()
+		if _, err := sqlDriver.ExecContext(ctx, vacuumSQL); err != nil {
+			return fmt.Errorf("failed to execute %s: %w", vacuumSQL, err)
+		}
+
+		log.Info(ctx, "PostgreSQL VACUUM completed",
+			log.Duration("duration", time.Since(start)),
+			log.String("command", vacuumSQL))
+
+		return nil
 	}
 
-	if _, err := sqlDriver.ExecContext(ctx, vacuumSQL); err != nil {
-		return fmt.Errorf("failed to execute %s: %w", vacuumSQL, err)
-	}
-
-	duration := time.Since(startTime)
-	log.Info(ctx, "Database VACUUM completed successfully",
-		log.Duration("duration", duration),
-		log.String("command", vacuumSQL))
+	log.Debug(ctx, "Database does not support VACUUM, skipping",
+		log.String("dialect", d))
 
 	return nil
 }

@@ -23,7 +23,7 @@ import (
 	_ "github.com/looplj/axonhub/internal/pkg/sqlite"
 )
 
-const defaultSQLiteBusyTimeoutMs = 5000
+const defaultSQLiteBusyTimeoutMs = 30000
 
 // NewEntClient creates an Ent client. When read_replica.read_dsn is configured,
 // SELECT/WITH queries are automatically routed to the replica; all writes go to master.

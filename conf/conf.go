@@ -258,7 +258,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Database defaults
 	v.SetDefault("db.dialect", "sqlite3")
-	v.SetDefault("db.dsn", "file:axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)")
+	v.SetDefault("db.dsn", "file:axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)")
 	v.SetDefault("db.disable_auto_migration", false)
 	v.SetDefault("db.disable_sqlite_auto_wal", false)
 	v.SetDefault("db.debug", false)
@@ -300,7 +300,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("metrics.exporter.insecure", false)
 
 	// GC defaults
-	v.SetDefault("gc.cron", "0 2 * * *") // Daily at 2:00 AM
+	v.SetDefault("gc.cron", "0 2 * * *") // Fallback cron (used only when interval is not set)
+	v.SetDefault("gc.interval", "24h")   // Preferred: run every 24h from process start
 	v.SetDefault("gc.vacuum_enabled", true)
 	v.SetDefault("gc.vacuum_full", false)
 
